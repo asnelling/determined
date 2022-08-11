@@ -1,5 +1,23 @@
 #!/bin/sh
 
+#
+# Determined Installation and Deployment Validation Tests
+# Experiments, Tasks
+#
+# This script runs one experiment for each combination of model type and resource
+# configuration below:
+#
+#   Model Type:
+#      1. Core API
+#      2. PyTorch
+#      3. DeepSpeed
+#
+#   Resource Configuration:
+#      1. single node, single GPU
+#      2. single node, multi  GPU (distributed)
+#      3. multi  node, multi  GPU (distributed)
+# 
+
 set -e
 
 readonly tmpdir="$(mktemp -d)"
@@ -21,17 +39,13 @@ core_api="./examples/tutorials/core_api"
 core_api_single_config="${core_api}/0_start.yaml"
 core_api_distributed_config="${core_api}/4_distributed.yaml"
 
-mnist_pytorch="./examples/tutorials/mnist_pytorch"
-mnist_pytorch_single_config="${mnist_pytorch}/const.yaml"
-mnist_pytorch_distributed_config="${mnist_pytorch}/distributed.yaml"
+pytorch="./examples/tutorials/mnist_pytorch"
+pytorch_single_config="${pytorch}/const.yaml"
+pytorch_distributed_config="${pytorch}/distributed.yaml"
 
 deepspeed="./examples/deepspeed/cifar10_moe"
 deepspeed_single_config="${deepspeed}/moe.yaml"
 deepspeed_distributed_config="${deepspeed}/moe.yaml"
-
-mnist_pytorch="./examples//mnist_pytorch"
-mnist_pytorch_single_config="${mnist_pytorch}/const.yaml"
-mnist_pytorch_distributed_config="${mnist_pytorch}/distributed.yaml"
 
 mgpu_mnode_num_slots=$(( ${DETVALID_SLOTS_PER_NODE} * 2 ))
 
@@ -79,9 +93,15 @@ det e create --test-mode --config "resources.slots_per_trial=${mgpu_mnode_num_sl
 # Tasks
 # =====
 
+# COM.TSK.RUN_CMD
+det cmd run echo foobar | grep foobar
+
 # COM.TSK.START_SHELL
-shell_id="$(echo exit
-        | det shell start 2>&1
+shell_id="$(echo exit           # disconnect right after connecting
+        | det shell start 2>&1  # use the first returned UUID as the shell ID
         | grep --max-count=1 -Eo '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')"
-    det shell logs "${shell_id}" | grep "disconnected by user"
-    det shell kill "${shell_id}"
+
+# confirm from master a successful connect and disconnect
+# TODO: false positive if "disconnected by user" from previous runs. find a better check
+det shell logs "${shell_id}" | grep "disconnected by user"
+det shell kill "${shell_id}"

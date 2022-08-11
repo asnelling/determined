@@ -81,9 +81,12 @@ test_70() {
 
 # COM.TSK.START_SHELL
 test_80() {
-    shell_id="$(echo exit
-        | det shell start 2>&1
+    shell_id="$(echo exit       # disconnect right after connecting
+        | det shell start 2>&1  # use the first returned UUID as the shell ID
         | grep --max-count=1 -Eo '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')"
+    
+    # confirm from master a successful connect and disconnect
+    # TODO: false positive if "disconnected by user" from previous runs. find a better check
     det shell logs "${shell_id}" | grep "disconnected by user"
     det shell kill "${shell_id}"
 }
