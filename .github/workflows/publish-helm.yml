@@ -30,37 +30,42 @@ jobs:
           # does github.event have the id in it already?  Hmm...
           #API=repos/{{ github.repository }}/releases/latest
           #gh api $API -q '"rel_id=" + (.id|tostring)' >> $GITHUB_ENV
-          printf 'rel_id=${{ github.event.release.id }}\n' >> $GITHUB_ENV
+          printf 'rel_tag=${{ github.ref_name }}\n' >> $GITHUB_ENV
       - if: github.event_name == 'workflow_dispatch'
         run: |
-          API=repos/${{ github.repository }}/releases/tags/${{ inputs.tag }}
-          gh api $API -q '"rel_id=" + (.id|tostring)' >> $GITHUB_ENV
+          #API=repos/${{ github.repository }}/releases/tags/${{ inputs.tag }}
+          printf 'rel_tag=${{ inputs.tag }}\n' >> $GITHUB_ENV
+      
+      - uses: actions/checkout@v3.0.2
+      - name: build helm chart tar.gz
+        run: |
+          make build-helm
+          NEW_CHART_DIR=$( mktemp -d )
+          CHART_NAME="determined-helm-chart_${rel_tag}.tar.gz"
+          mv helm/build/determined-*.tar.gz "$NEW_CHART_DIR/$CHART_NAME"
+          {
+            printf 'NEW_CHART_DIR=%s\n' "$NEW_CHART_DIR"
+            printf 'CHART_NAME=%s\n' "$CHART_NAME"
+          } >> $GITHUB_ENV
 
-      # get the artifact for the chart and the branch for the chart repo
+      - name: upload helm chart
+        run: |
+          gh release upload "$rel_tag" "$NEW_CHART_DIR/$CHART_NAME"
+
+      # get the URL for the chart and the branch for the chart repo
       - name: check out chart repo branch
         uses: actions/checkout@v3.0.2
         with:
           ref: helm-chart-repository
           token: ${{ secrets.DETERMINED_CI_RELEASE_PAT }}
-      - name: get chart artifact
+      - name: get chart URL
         run: |
-          NEW_CHART_DIR=$( mktemp -d )
-          pushd "$NEW_CHART_DIR"
           ASSET_URL=$( \
             gh api "repos/${{ github.repository }}/releases/${rel_id}/assets" \
             -q '.[] | select(.name|test("determined-helm-chart.*")) | .url' \
             )
-          #CHART_NAME=$( gh api $ASSET_URL -q '.name|sub("-helm-chart";"")' )
-          CHART_NAME=$( gh api $ASSET_URL -q .name )
-          gh api -H "Accept: application/octet-stream" "$ASSET_URL" \
-            > "$CHART_NAME"
-          popd
-          {
-            printf 'NEW_CHART_DIR=%s\n' "$NEW_CHART_DIR"
-            printf 'CHART_NAME=%s\n' "$CHART_NAME"
-            printf 'CHART_URL=%s\n' \
-              "$( gh api "$ASSET_URL" -q '.browser_download_url')"
-          } >> $GITHUB_ENV
+          CHART_URL=$( gh api "$ASSET_URL" -q '.browser_download_url')
+          printf 'CHART_URL=%s\n' "$CHART_URL" >> $GITHUB_ENV
 
       # publish to GH Pages repository
       # TODO: consider also publishing to artifact hub
