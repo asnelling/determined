@@ -75,6 +75,9 @@ release:
   github:
     owner: determined-ai
     name: determined
+  extra_files:
+    - glob: helm/build/determined-*.tgz
+      name_template: "determined-helm-chart_{{.Env.VERSION}}.tgz"
 
 dockers:
   - goos: linux
