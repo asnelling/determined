@@ -1,0 +1,10 @@
+project_name: determined-helm
+
+release:
+  github:
+    owner: asnelling
+    name: determined
+  mode: keep-existing
+  extra_files:
+    - glob: helm/build/determined-*.tgz
+      name_template: "determined-helm-chart_{{.Env.VERSION}}.tgz"
