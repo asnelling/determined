@@ -1,5 +1,8 @@
 project_name: determined-helm
 
+build:
+  skip: true
+
 release:
   github:
     owner: asnelling
