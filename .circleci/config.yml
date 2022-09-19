@@ -1169,8 +1169,8 @@ jobs:
       - attach_workspace:
           at: .
       - helm/install-helm-client
-      - run: helm plugin install https://github.com/chartmuseum/helm-push.git
-      - login-helm
+      # - run: helm plugin install https://github.com/chartmuseum/helm-push.git
+      # - login-helm
       - run: go install github.com/goreleaser/goreleaser@v1.1.0
       - run: make -C helm release
 
