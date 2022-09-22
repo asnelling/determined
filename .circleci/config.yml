@@ -83,10 +83,873 @@ any-upstream: &any-upstream
     ignore:
       - /pull\/.*/
 
+
 commands:
+  fix-circle-working-directory:
+    description: "Fix CIRCLE_WORKING_DIRECTORY"
+    steps:
+      - run: echo 'CIRCLE_WORKING_DIRECTORY="${CIRCLE_WORKING_DIRECTORY/#\~/$HOME}"' >> $BASH_ENV
+
+  # circleci's checkout does not fetch submodules by default
+  # https://circleci.com/docs/2.0/configuration-reference/#checkout
+  checkout-with-sm:
+    steps:
+      - checkout
+      - run: git submodule sync
+      - run: git submodule update --init
+
+  skip-if-docs-only:
+    steps:
+      - run: git remote add upstream https://github.com/determined-ai/determined
+      - run: git fetch upstream
+      - run:
+          name: check for docs-only changes
+          command: |
+            MERGE_BASE="$(git merge-base upstream/master HEAD)"
+            DIFF_DIRS="$(git diff-tree --no-commit-id --name-only "$MERGE_BASE" HEAD)"
+            if [ "$DIFF_DIRS" = "docs" ] ; then
+              echo "docs-only change detected, halting job now"
+              circleci-agent step halt
+            else
+              echo "detected non-docs-only changes: $DIFF_DIRS"
+            fi
+  skip-if-webui-only:
+    steps:
+      - run: git fetch upstream
+      - run:
+          name: check for webui-only changes  # must be run after skip-if-docs-only
+          command: |
+            MERGE_BASE="$(git merge-base upstream/master HEAD)"
+            DIFF_DIRS="$(git diff-tree --no-commit-id --name-only "$MERGE_BASE" HEAD)"
+            if [ "$DIFF_DIRS" = "webui" ] ; then
+              echo "webui-only change detected, halting job now"
+              circleci-agent step halt
+            else
+              echo "detected non-webui-only changes: $DIFF_DIRS"
+            fi
+  skip-if-not-shared:
+    steps:
+      - run: git remote add upstream https://github.com/determined-ai/determined
+      - run: git fetch upstream
+      - run:
+          name: check for shared changes
+          command: |
+            MERGE_BASE="$(git merge-base upstream/master HEAD)"
+            DIFF_DIRS="$(git diff-tree --no-commit-id --name-only "$MERGE_BASE":webui/react/src HEAD:webui/react/src)"
+            if [ "$DIFF_DIRS" = "shared" ] ; then
+              echo "shared code changed, running downstream test"
+            else
+              echo "shared code not affected, halting job now"
+              circleci-agent step halt
+            fi
+  set-slack-user-id:
+    steps:
+      - run:
+          name: Set Slack variables
+          command: |
+            if ! [ -x "$(command -v jq)" ]; then
+              apt update && apt install -y jq
+            fi
+            AUTHOR_EMAIL="$(git show -s --format='%ae' $CIRCLE_SHA1)"
+            echo "export AUTHOR_EMAIL=\"${AUTHOR_EMAIL}\"" >> $BASH_ENV
+            LOOKUP_RESPONSE=$(curl -s "https://slack.com/api/users.lookupByEmail?token=${SLACK_API_TOKEN}&email=${AUTHOR_EMAIL}")
+            SUCCESS=$(echo "$LOOKUP_RESPONSE" | jq ".ok")
+            if [[ "$SUCCESS" == "true" ]]; then
+              SLACK_USER_ID=$(echo "$LOOKUP_RESPONSE" | jq -r ".user.id")
+              SLACK_NAME=$(echo "$LOOKUP_RESPONSE" | jq -r ".user.name")
+              echo "export SLACK_NAME=\"${SLACK_NAME}\"" >> $BASH_ENV
+              echo "export SLACK_USER_ID=\"${SLACK_USER_ID}\"" >> $BASH_ENV
+            else
+              echo "Unable to find Slack user ID for  \"${AUTHOR_EMAIL}\"."
+            fi
+  pull-task-images:
+    parameters:
+      tf1:
+        type: boolean
+        default: false
+      tf2:
+        type: boolean
+        default: false
+    steps:
+      - when:
+          condition: <<parameters.tf1>>
+          steps:
+            - run: docker pull determinedai/environments:py-3.7-pytorch-1.7-tf-1.15-cpu-9119094
+      - when:
+          condition: <<parameters.tf2>>
+          steps:
+            - run: docker pull determinedai/environments:py-3.8-pytorch-1.10-tf-2.8-cpu-9119094
+
+  login-docker:
+    parameters:
+      repository:
+        type: string
+        default: ""
+      username:
+        type: string
+      password:
+        type: string
+    steps:
+      - run: echo "<<parameters.password>>" | docker login <<parameters.repository>> -u "<<parameters.username>>" --password-stdin
+
   login-helm:
     steps:
       - run: helm repo add determined https://helm.ngc.nvidia.com/isv-ngc-partner/determined --username=$NGC_API_USERNAME --password=$NGC_API_KEY
+
+  reinstall-go:
+    steps:
+      - run: sudo rm -rf /usr/local/go # Remove system go.
+      - run: curl https://dl.google.com/go/go1.18.linux-amd64.tar.gz -o /tmp/go.linux-amd64.tar.gz
+      - run: sudo tar -C /usr/local -xzf /tmp/go.linux-amd64.tar.gz
+
+  install-protoc:
+    steps:
+      - run: curl -o /tmp/protoc.zip -L https://github.com/protocolbuffers/protobuf/releases/download/v3.17.1/protoc-3.17.1-linux-x86_64.zip
+      - run: unzip /tmp/protoc.zip -d $HOME/.local
+
+  setup-go-intg-deps:
+    steps:
+      - install-protoc # Install newer version of protoc into $HOME/.local/bin, since default is proto2.
+      - run: PATH=$HOME/.local/bin:$PATH make -C proto get-deps
+      - run: PATH=$HOME/.local/bin:$PATH make -C proto build
+      - run: make -C master get-deps
+      - run: make -C agent get-deps
+      - install-devcluster
+      - start-devcluster:
+          target-stage: elastic
+          devcluster-config: elastic-base.devcluster.yaml
+
+  go-get-deps:
+    steps:
+      - install-protoc
+      - restore_cache:
+          keys:
+            - det-go-deps-<<pipeline.parameters.cache-buster>>-{{ checksum  "master/go.sum" }}-{{ checksum  "agent/go.sum" }}-{{ checksum  "proto/go.sum" }}
+      - run: make -C proto get-deps
+      - run: make -C master get-deps
+      - run: make -C agent get-deps
+      - save_cache:
+          key: det-go-deps-<<pipeline.parameters.cache-buster>>-{{ checksum  "master/go.sum" }}-{{ checksum  "agent/go.sum" }}-{{ checksum  "proto/go.sum" }}
+          paths:
+            - "/home/circleci/go/pkg/mod/"
+  react-get-deps:
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          keys:
+            - det-react-deps-<<pipeline.parameters.cache-buster>>-{{ checksum  "webui/react/package-lock.json" }}
+      - run:
+          name: Get React dependencies
+          command: |
+            if [ ! -d "webui/react/node_modules" ]; then
+              make -C webui/react get-deps-npm
+            fi
+      - save_cache:
+          key: det-react-deps-<<pipeline.parameters.cache-buster>>-{{ checksum  "webui/react/package-lock.json" }}
+          paths:
+            - "webui/react/node_modules"
+
+  install-wheel:
+    parameters:
+      package-name:
+        type: string
+      package-location:
+        type: string
+    steps:
+      - run:
+          name: Install <<parameters.package-name>>
+          working_directory: <<parameters.package-location>>
+          command: |
+            make build
+            pip install --find-links dist <<parameters.package-name>>==<< pipeline.parameters.det-version >>
+            pip install --no-deps --force-reinstall --find-links dist <<parameters.package-name>>==<< pipeline.parameters.det-version >>
+  setup-python-venv:
+    description: Set up and create Python venv.
+    parameters:
+      determined:
+        type: boolean
+        default: false
+      model-hub:
+        type: boolean
+        default: false
+      install-python:
+        type: boolean
+        default: true
+      extras-requires:
+        type: string
+        default: ""
+      extra-requirements-file:
+        type: string
+        default: ""
+      executor:
+        type: string
+      python-version:
+        type: string
+        default: "3.7.11"
+    steps:
+      - when:
+          condition: <<parameters.install-python>>
+          steps:
+            - run:
+                name: prepare conda PATH
+                command: |
+                  echo 'export PATH=/opt/conda/bin:${PATH}' >> $BASH_ENV
+            - run:
+                name: prepare conda install_python.sh
+                command: |
+                  cat \<<'EOF' > /tmp/install_python.sh
+                  #!/bin/bash
+                  PYTHON_VERSION="${1}"
+                  CONDA_DIR="/opt/conda"
+                  CONDA_INSTALLER="Miniconda3-py39_4.10.3-Linux-x86_64.sh"
+                  CONDA_MD5="8c69f65a4ae27fb41df0fe552b4a8a3b"
+                  CONDA_URL="https://repo.anaconda.com/miniconda"
+                  mkdir -p /etc/determined/conda.d
+                  mkdir -p "${CONDA_DIR}"
+                  cd /tmp
+                  curl --retry 3 -fsSL -O "${CONDA_URL}/${CONDA_INSTALLER}"
+                  echo "${CONDA_MD5}  ${CONDA_INSTALLER}" | md5sum -c -
+                  bash "./${CONDA_INSTALLER}" -u -b -p "${CONDA_DIR}"
+                  rm -f "./${CONDA_INSTALLER}"
+                  ${CONDA_DIR}/bin/conda install python=${PYTHON_VERSION}
+                  ${CONDA_DIR}/bin/conda update --prefix ${CONDA_DIR} --all -y
+                  ${CONDA_DIR}/bin/conda clean --all -y
+                  EOF
+            - run:
+                name: run conda install_python.sh
+                command: |
+                  sudo bash /tmp/install_python.sh <<parameters.python-version>>
+            - run:
+                name: Setup venv
+                command: |
+                  python3 -m venv /tmp/venv
+                  echo 'export PATH=/tmp/venv/bin:$PATH' >> $BASH_ENV
+                  /tmp/venv/bin/python -m pip install --upgrade pip wheel setuptools
+      - run:
+          name: Write cache key
+          command: |
+            echo <<parameters.executor>> > /tmp/cachefile
+            pip freeze --all >> /tmp/cachefile
+            if [ "<<parameters.determined>>" = "true" ]; then
+              cat harness/setup.py >> /tmp/cachefile
+            fi
+            if [ "<<parameters.model-hub>>" = "true" ]; then
+              cat model_hub/setup.py >> /tmp/cachefile
+            fi
+            echo <<parameters.extras-requires>> >> /tmp/cachefile
+            if [ -n <<parameters.extra-requirements-file>> ]; then
+              cat <<parameters.extra-requirements-file>> >> /tmp/cachefile
+            fi
+      - restore_cache:
+          keys:
+            - det-python-deps-<<pipeline.parameters.cache-buster>>-{{ checksum "/tmp/cachefile" }}
+      - when:
+          condition: <<parameters.determined>>
+          steps:
+            - install-wheel:
+                package-name: determined
+                package-location: ~/project/harness
+      - when:
+          condition: <<parameters.model-hub>>
+          steps:
+            - run:
+                name: Install mmdetection dependencies
+                command: |
+                  sudo apt-get update
+                  sudo apt-get install -y ffmpeg libsm6 libxext6
+            - install-wheel:
+                package-name: model-hub
+                package-location: ~/project/model_hub
+      - run:
+          name: Install <<parameters.extras-requires>>
+          command: |
+            if [ -n "<<parameters.extras-requires>>" ]; then
+              pip install --progress-bar off <<parameters.extras-requires>>
+            fi
+      - run:
+          name: Install <<parameters.extra-requirements-file>>
+          command: |
+            if [ -n "<<parameters.extra-requirements-file>>" ]; then
+              pip install -r <<parameters.extra-requirements-file>>
+            fi
+      - save_cache:
+          key: det-python-deps-<<pipeline.parameters.cache-buster>>-{{ checksum "/tmp/cachefile" }}
+          paths:
+            - "/tmp/venv"
+      - run: python --version
+      - run: pip --version
+      - run: pip freeze --all
+      # Allow this to fail, but it is useful for debugging.
+      - run: sh -c "pip check || true"
+
+  run-e2e-tests:
+    parameters:
+      mark:
+        type: string
+        default: ""
+      junit-path:
+        type: string
+        default: "/tmp/test-results/e2e/tests.xml"
+      master-scheme:
+        type: string
+        default: "http"
+      master-host:
+        type: string
+        default: "localhost"
+      master-port:
+        type: string
+        default: "8080"
+      master-cert:
+        type: string
+        default: ""
+      master-cert-name:
+        type: string
+        default: ""
+      managed-devcluster:
+        type: boolean
+        default: false
+      extra-pytest-flags:
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Split tests
+          working_directory: ~/project/e2e_tests
+          command: |
+            # If a test mark is specified, preselect only files that contain tests with that mark to
+            # minimize how wrong CircleCI's splitting can get things.
+            if [ -n "<<parameters.mark>>" ]; then
+              mark="<<parameters.mark>>"
+              # Extract the first mark for complex conditions such as 'mark1 and not mark2'.
+              mark_prefix=${mark%% and*}
+              find tests -name 'test*.py' -print0 | xargs -0 grep -rl "pytest\.mark\.$mark_prefix"
+            else
+              circleci tests glob 'tests/**/test*.py'
+            fi | circleci tests split --split-by=timings > /tmp/tests-to-run
+            echo "Running tests from these files:"
+            sed 's/^/- /' </tmp/tests-to-run
+      - unless:
+          condition: <<parameters.managed-devcluster>>
+          steps:
+            - wait-for-master:
+                scheme: <<parameters.master-scheme>>
+                host: <<parameters.master-host>>
+                port: <<parameters.master-port>>
+
+      - run:
+          name: Run e2e tests
+          working_directory: ~/project/e2e_tests
+          no_output_timeout: 30m
+          command: |
+            DET_MASTER_CERT_FILE=<<parameters.master-cert>> DET_MASTER_CERT_NAME=<<parameters.master-cert-name>> \
+            pytest -vv -s \
+            -m '<<parameters.mark>>' \
+            --durations=0 \
+            --master-scheme="<<parameters.master-scheme>>" \
+            --master-host="<<parameters.master-host>>" \
+            --master-port="<<parameters.master-port>>" \
+            -o junit_family=xunit1 \
+            --junit-xml="<<parameters.junit-path>>" \
+            <<parameters.extra-pytest-flags>> \
+            $(< /tmp/tests-to-run)
+      - upload-test-job:
+          only_on_branch: master
+          test_results_path: <<parameters.junit-path>>
+
+  run-det-deploy-tests:
+    parameters:
+      mark:
+        type: string
+        default: ""
+      det-version:
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Run det-deploy tests
+          working_directory: ~/project/e2e_tests
+          command: |
+            pytest -vv -s \
+            -m <<parameters.mark>> \
+            --det-version="<<parameters.det-version>>"
+  deploy-aws-cluster:
+    parameters:
+      cluster-id:
+        type: string
+      det-version:
+        type: string
+      keypair:
+        type: string
+        default: "integrations-test"
+      enable-cors:
+        type: boolean
+        default: false
+      master-tls-cert:
+        type: string
+        default: ""
+      master-tls-key:
+        type: string
+        default: ""
+      master-cert-name:
+        type: string
+        default: ""
+      aux-agent-instance-type:
+        type: string
+        default: "m5.large"
+      compute-agent-instance-type:
+        type: string
+        default: "p2.xlarge"
+      max-dynamic-agents:
+        type: integer
+        default: 1
+      retain-log-group:
+        type: boolean
+        default: false
+      log-group-prefix:
+        type: string
+        default: ""
+      reattach-enabled:
+        type: boolean
+        default: false
+    steps:
+      - run:
+          name: Initialize extra arguments
+          command: touch /tmp/det-deploy-extra-args
+      - when:
+          condition:
+            equal:
+               [ true, << parameters.enable-cors >> ]
+          steps:
+          - run:
+              name: Enable CORS
+              command: 'echo --enable-cors >> /tmp/det-deploy-extra-args'
+
+      - run:
+          name: Configure TLS arguments
+          command: |
+            if [ -n "<<parameters.master-tls-cert>>" ]; then echo "--master-tls-cert <<parameters.master-tls-cert>>" >> /tmp/det-deploy-extra-args; fi
+            if [ -n "<<parameters.master-tls-key>>" ]; then echo "--master-tls-key <<parameters.master-tls-key>>" >> /tmp/det-deploy-extra-args; fi
+            if [ -n "<<parameters.master-cert-name>>" ]; then echo "--master-cert-name <<parameters.master-cert-name>>" >> /tmp/det-deploy-extra-args; fi
+      - run:
+          name: Configure log group arguments
+          command: |
+            if <<parameters.retain-log-group>>; then echo "--retain-log-group" >> /tmp/det-deploy-extra-args; fi
+            if [ -n "<<parameters.log-group-prefix>>" ]; then echo "--log-group-prefix <<parameters.log-group-prefix>>" >> /tmp/det-deploy-extra-args; fi
+      - when:
+          condition:
+            equal:
+              [ true, <<parameters.reattach-enabled>> ]
+          steps:
+          - run:
+              name: set reattach-enabled
+              command: echo --agent-reattach-enabled true --agent-reconnect-attempts 24 --no-update-terminate-agents >> /tmp/det-deploy-extra-args
+      - run:
+          name: Deploy AWS cluster
+          command: |
+            echo "-----BEGIN ARGS-----"
+            cat /tmp/det-deploy-extra-args
+            echo "-----END ARGS-----"
+            det deploy aws up \
+              $(< /tmp/det-deploy-extra-args) \
+              --cluster-id <<parameters.cluster-id>> \
+              --det-version <<parameters.det-version>> \
+              --aux-agent-instance-type <<parameters.aux-agent-instance-type>> \
+              --compute-agent-instance-type <<parameters.compute-agent-instance-type>> \
+              --max-dynamic-agents <<parameters.max-dynamic-agents>> \
+              --keypair <<parameters.keypair>> \
+              --yes
+  terminate-aws-cluster:
+    parameters:
+      cluster-id:
+        type: string
+    steps:
+      - run:
+          name: Terminate AWS Cluster
+          when: always
+          command: |
+            det deploy aws down \
+              --cluster-id <<parameters.cluster-id>> --yes
+  setup-aws-cluster:
+    parameters:
+      cluster-id:
+        type: string
+      det-version:
+        type: string
+      compute-agent-instance-type:
+        type: string
+        default: "p2.xlarge"
+      aux-agent-instance-type:
+        type: string
+        default: "m5.large"
+      max-dynamic-agents:
+        type: integer
+        default: 1
+      master-tls-cert:
+        type: string
+      master-tls-key:
+        type: string
+      master-cert-name:
+        type: string
+    steps:
+      - set-cluster-id:
+          cluster-id: <<parameters.cluster-id>>
+      - deploy-aws-cluster:
+          cluster-id: ${CLUSTER_ID}
+          det-version: <<parameters.det-version>>
+          aux-agent-instance-type: <<parameters.aux-agent-instance-type>>
+          compute-agent-instance-type: <<parameters.compute-agent-instance-type>>
+          max-dynamic-agents: <<parameters.max-dynamic-agents>>
+          master-tls-cert: <<parameters.master-tls-cert>>
+          master-tls-key: <<parameters.master-tls-key>>
+          master-cert-name: <<parameters.master-cert-name>>
+          log-group-prefix: determined-ci
+          retain-log-group: true
+      - set-master-address-aws:
+          cluster-id: ${CLUSTER_ID}
+          master-tls-cert: <<parameters.master-tls-cert>>
+          master-tls-key: <<parameters.master-tls-key>>
+
+  terminate-gke-cluster:
+    parameters:
+      cluster-id:
+        type: string
+      region:
+        type: string
+    steps:
+      # Use a run instead of `gke/helm` orbs because circle CI orbs do not support `when`.
+      - run:
+          name: Delete Helm release
+          when: always
+          command: helm delete ci
+      - run:
+          name: Terminate GKE Cluster
+          when: always
+          command: |
+            gcloud container clusters delete <<parameters.cluster-id>> --quiet --region=<<parameters.region>>
+  setup-gke-cluster:
+    parameters:
+      cluster-id:
+        type: string
+      det-version:
+        type: string
+      gke-version:
+        type: string
+      machine-type:
+        type: string
+      num-machines:
+        type: integer
+      gpu-type:
+        type: string
+      gpus-per-machine:
+        type: integer
+      slot-type:
+        type: string
+      slot-resource-requests-cpu:
+        type: integer
+      region:
+        type: string
+      node-locations:
+        type: string
+      gcloud-service-key:
+        default: GCLOUD_SERVICE_KEY
+        description: The gcloud service key
+        type: env_var_name
+      google-compute-zone:
+        default: GOOGLE_COMPUTE_ZONE
+        description: The Google compute zone to connect with via the gcloud CLI
+        type: env_var_name
+      google-project-id:
+        default: GOOGLE_PROJECT_ID
+        description: The Google project ID to connect with via the gcloud CLI
+        type: env_var_name
+    steps:
+      - set-cluster-id:
+          cluster-id: <<parameters.cluster-id>>
+      - gcloud/install:
+          version: "319.0.0"
+      - kubernetes/install-kubectl
+      - gcloud/initialize:
+          gcloud-service-key: <<parameters.gcloud-service-key>>
+          google-compute-zone: <<parameters.google-compute-zone>>
+          google-project-id: <<parameters.google-project-id>>
+      - run:
+          command: gcloud container clusters create ${CLUSTER_ID} --machine-type=n1-standard-8 --cluster-version=<<parameters.gke-version>> --region=<<parameters.region>> --node-locations=<<parameters.node-locations>> --scopes storage-rw,cloud-platform --num-nodes 1 --labels environment=ci --no-enable-ip-alias --subnetwork default
+          name: Create GKE cluster
+          no_output_timeout: 30m
+      - run:
+          command: gcloud container clusters get-credentials ${CLUSTER_ID} --project determined-ai --region <<parameters.region>>
+          name: Get Kubeconfig
+      - when:
+          condition: <<parameters.gpus-per-machine>>
+          steps:
+          - run:
+              command: kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded.yaml
+              name: Install NVIDIA drivers
+          - helm/install-helm-chart:
+              chart: helm/charts/determined
+              helm-version: v3.2.4
+              namespace: "default"
+              wait: true
+              release-name: "ci"
+              values-to-override: |
+                detVersion=<<parameters.det-version>>,\
+                maxSlotsPerPod=<<parameters.gpus-per-machine>>,\
+                checkpointStorage.type=gcs,\
+                checkpointStorage.bucket=det-ci
+      - unless:
+          condition: <<parameters.gpus-per-machine>>
+          steps:
+          - helm/install-helm-chart:
+              chart: helm/charts/determined
+              helm-version: v3.2.4
+              namespace: "default"
+              wait: true
+              release-name: "ci"
+              values-to-override: |
+                detVersion=<<parameters.det-version>>,\
+                maxSlotsPerPod=1,\
+                checkpointStorage.type=gcs,\
+                checkpointStorage.bucket=det-ci,\
+                slotType=<<parameters.slot-type>>,\
+                slotResourceRequests.cpu=<<parameters.slot-resource-requests-cpu>>
+      - set-master-address-gke:
+          release-name: "ci"
+          namespace: "default"
+      - when:
+          condition: <<parameters.gpus-per-machine>>
+          steps:
+          - run:
+              command: gcloud container node-pools create accel --cluster ${CLUSTER_ID} --region <<parameters.region>> --num-nodes <<parameters.num-machines>> --accelerator type=<<parameters.gpu-type>>,count=<<parameters.gpus-per-machine>> --machine-type=<<parameters.machine-type>> --scopes cloud-platform
+              name: Create GPU node pool
+      - unless:
+          condition: <<parameters.gpus-per-machine>>
+          steps:
+          - run:
+              command: gcloud container node-pools create accel --cluster ${CLUSTER_ID} --region <<parameters.region>> --num-nodes <<parameters.num-machines>> --machine-type=<<parameters.machine-type>> --scopes cloud-platform
+              name: Create CPU node pool
+
+  setup-gke-cluster-cuda-11:
+    parameters:
+      cluster-id:
+        type: string
+      det-version:
+        type: string
+      gke-version:
+        type: string
+      machine-type:
+        type: string
+      num-machines:
+        type: integer
+      gpu-type:
+        type: string
+      gpus-per-machine:
+        type: integer
+      region:
+        type: string
+      node-locations:
+        type: string
+      gcloud-service-key:
+        default: GCLOUD_SERVICE_KEY
+        description: The gcloud service key
+        type: env_var_name
+      google-compute-zone:
+        default: GOOGLE_COMPUTE_ZONE
+        description: The Google compute zone to connect with via the gcloud CLI
+        type: env_var_name
+      google-project-id:
+        default: GOOGLE_PROJECT_ID
+        description: The Google project ID to connect with via the gcloud CLI
+        type: env_var_name
+      environment-image:
+        default: determinedai/environments:cuda-11.3-pytorch-1.10-tf-2.8-gpu-0.19.1
+        type: string
+    steps:
+      - set-cluster-id:
+          cluster-id: <<parameters.cluster-id>>
+      - gcloud/install:
+          version: "319.0.0"
+      - kubernetes/install-kubectl
+      - gcloud/initialize:
+          gcloud-service-key: <<parameters.gcloud-service-key>>
+          google-compute-zone: <<parameters.google-compute-zone>>
+          google-project-id: <<parameters.google-project-id>>
+      - run:
+          command: gcloud container clusters create ${CLUSTER_ID} --machine-type=n1-standard-8 --cluster-version=<<parameters.gke-version>> --region=<<parameters.region>> --node-locations=<<parameters.node-locations>> --scopes storage-rw,cloud-platform --num-nodes 1 --no-enable-ip-alias --subnetwork default
+          name: Create GKE cluster
+          no_output_timeout: 30m
+      - run:
+          command: gcloud container node-pools create accel --cluster ${CLUSTER_ID} --region <<parameters.region>> --num-nodes <<parameters.num-machines>> --accelerator type=<<parameters.gpu-type>>,count=<<parameters.gpus-per-machine>> --machine-type=<<parameters.machine-type>> --scopes cloud-platform
+          name: Create GPU node pool
+      - run:
+          command: gcloud container clusters get-credentials ${CLUSTER_ID} --project determined-ai --region <<parameters.region>>
+          name: Get Kubeconfig
+      - run:
+          command: kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded.yaml
+          name: Install NVIDIA drivers
+      - run:
+          command: kubectl create clusterrolebinding cluster-admin-binding --clusterrole cluster-admin --user "$(gcloud config get-value account)"
+          name: Setup cluster role binding
+      - helm/install-helm-chart:
+          chart: helm/charts/determined
+          helm-version: v3.2.4
+          namespace: "default"
+          wait: true
+          release-name: "ci"
+          values-to-override: |
+            detVersion=<<parameters.det-version>>,\
+            maxSlotsPerPod=<<parameters.gpus-per-machine>>,\
+            taskContainerDefaults.cpuImage=<<parameters.environment-image>>,\
+            taskContainerDefaults.gpuImage=<<parameters.environment-image>>,\
+            checkpointStorage.type=gcs,\
+            checkpointStorage.bucket=det-ci
+      - set-master-address-gke:
+          release-name: "ci"
+          namespace: "default"
+
+  generate-tls-cert:
+    steps:
+      - run: |
+          .circleci/scripts/generate_cert.sh /tmp/master
+          echo 'export MASTER_TLS_CERT=/tmp/master.crt MASTER_TLS_KEY=/tmp/master.key MASTER_CERT_NAME=determined-master-ci' >> $BASH_ENV
+  set-master-address-aws:
+    parameters:
+      cluster-id:
+        type: string
+      master-tls-cert:
+        type: string
+      master-tls-key:
+        type: string
+    steps:
+      - run: |
+          MASTER_HOST=$(python .circleci/scripts/get_output_from_stack.py <<parameters.cluster-id>> DeterminedAddress)
+          echo "export MASTER_HOST=\"${MASTER_HOST}\"" >> $BASH_ENV
+      - run: |
+          if [ -n "<<parameters.master-tls-cert>>" ] && [ -n "<<parameters.master-tls-key>>" ]; then
+            echo "export MASTER_PORT=8443" >> $BASH_ENV
+            echo "export MASTER_SCHEME=https" >> $BASH_ENV
+          fi
+  set-master-address-gke:
+    parameters:
+      release-name:
+        type: string
+      namespace:
+        type: string
+    steps:
+      - run:
+          name: Set Master Address
+          command: |
+            MASTER_HOST=$(kubectl get -n <<parameters.namespace>>  service determined-master-service-<<parameters.release-name>> \
+            --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            echo "export MASTER_HOST=\"${MASTER_HOST}\"" >> $BASH_ENV
+            echo "${MASTER_HOST}"
+  set-google-application-credentials:
+    steps:
+      - run:
+          name: Set Google Application Credentials
+          command: |
+            GOOGLE_APPLICATION_CREDENTIALS=${HOME}/gcloud-service-key.json
+            echo "export GOOGLE_APPLICATION_CREDENTIALS=\"${GOOGLE_APPLICATION_CREDENTIALS}\"" >> $BASH_ENV
+  set-cluster-id:
+    parameters:
+      cluster-id:
+        type: string
+    steps:
+      - run: echo "export CLUSTER_ID=\"<<parameters.cluster-id>>\"" >> $BASH_ENV
+
+  wait-for-master:
+    parameters:
+      scheme:
+        type: string
+        default: "http"
+      host:
+        type: string
+      port:
+        type: string
+        default: "8080"
+    steps:
+      - run: python .circleci/scripts/wait_for_master.py <<parameters.scheme>>://<<parameters.host>>:<<parameters.port>>
+
+  upload-test-job:
+    parameters:
+      only_on_branch:
+        type: string
+        default: ""
+      test_results_path:
+        type: string
+        default: ""
+    steps:
+      - when:
+          condition:
+            equal: [ <<parameters.only_on_branch>>, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Test run success -> uploading results to Determined CI
+                command: |
+                  python .circleci/scripts/upload_test_results.py \
+                  'success' \
+                  ${CIRCLE_NODE_INDEX} \
+                  <<parameters.test_results_path>> \
+                  ${CIRCLE_BUILD_NUM} \
+                  ${DET_CI_ACCESS_KEY} \
+                  ${DET_CI_URL}
+                when: on_success
+            - run:
+                name: Test run failed -> uploading results to Determined CI
+                command: |
+                  python .circleci/scripts/upload_test_results.py \
+                  'failed' \
+                  ${CIRCLE_NODE_INDEX} \
+                  <<parameters.test_results_path>> \
+                  ${CIRCLE_BUILD_NUM} \
+                  ${DET_CI_ACCESS_KEY} \
+                  ${DET_CI_URL}
+                when: on_fail
+
+  locate-cloudwatch-logs:
+    parameters:
+      cluster-id:
+        type: string
+      region:
+        type: string
+        default: us-west-2
+    steps:
+      - run:
+          name: Locate CloudWatch logs
+          when: always
+          command: |
+            LOG_GROUP=$(python .circleci/scripts/get_output_from_stack.py <<parameters.cluster-id>> LogGroup)
+            echo "Cluster logs can be found in CloudWatch under the log group $LOG_GROUP"
+            echo "or the URL below (if the log group is in your default region):"
+            ENC_LOG_GROUP=$(echo "$LOG_GROUP" | sed 's|/|$252F|g')
+            echo "https://console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/$ENC_LOG_GROUP"
+  pre-package-and-push-system:
+    steps:
+      - go-get-deps
+      - run: make -C proto build
+      - run: make -C master check
+      - run: make -C agent check
+
+  install-devcluster:
+    steps:
+      - run: pip install git+https://github.com/determined-ai/devcluster.git@v1.1.0#egg=devcluster
+      - run:
+          command: |
+            if ! [ -x "$(command -v socat)" ]; then
+              apt update && apt install -y socat
+            fi
+  start-devcluster:
+    parameters:
+      devcluster-config:
+        type: string
+        default: double.devcluster.yaml
+      target-stage:
+        type: string
+        default: agent1
+    steps:
+      - run:
+          command: devcluster --oneshot -c .circleci/devcluster/<<parameters.devcluster-config>> --target-stage <<parameters.target-stage>>
+          background: true
 
 jobs:
   build-helm:
