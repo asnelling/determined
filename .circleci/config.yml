@@ -1176,9 +1176,7 @@ jobs:
 
   publish-helm-gh:
     docker:
-      - image: cimg/go:1.18
-        environment:
-          GO111MODULE: "on"
+      - image: <<pipeline.parameters.docker-image>>
     steps:
       - checkout
       - attach_workspace:
