@@ -69,6 +69,57 @@ tutorial for your preferred deep learning framework:
 The documentation for the latest version of Determined can always be found
 [here](https://docs.determined.ai).
 
+## Building From Source
+
+1.  Install the following pre-requisite packages, based on your build platform.
+
+    Note: Some packages, linked below, may not be available in the official distribution's repositories.
+
+    | Name              | Version     | Arch Linux         | Ubuntu                  |
+    | ----------------- | ----------- | ------------------ | ----------------------- |
+    | docker            | latest      | docker             | [docker][]              |
+    | go                | latest      | go                 | golang                  |
+    | helm              | latest      | helm               | [helm][]                |
+    | Java Runtime      | 11+         | jre-openjdk        | default-jre             |
+    | jq                | latest      | jq                 | jq                      |
+    | make              | latest      | make               | make                    |
+    | NodeJS            | >=16.13 <17 | nodejs-lts-gallium | [nodejs][] (NodeSource) |
+    | npm               | latest      | npm                | npm                     |
+    | Protobuf Compiler | latest      | protobuf           | protobuf-compiler       |
+    | Python            | 3.7 - 3.9   | [python38][] (AUR) | python3.8               |
+
+    [docker]: https://docs.docker.com/desktop/install/ubuntu/
+    [helm]: https://helm.sh/docs/intro/install/#from-apt-debianubuntu
+    [nodejs]: https://github.com/nodesource/distributions/blob/master/README.md#using-ubuntu-2
+    [python38]: https://aur.archlinux.org/packages/python38/
+
+2.  Configure the build environment
+
+    ```shell
+    $ python3.8 -m venv ~/.virtualenvs/determined
+    $ source ~/.virtualenvs/determined/bin/actvate
+    $ export PATH="$HOME/go/bin:$PATH"
+    ```
+
+3.  Build
+
+    ```Shell
+    $ make
+    $ make package
+    ```
+
+    If you encounter error `ERR_OSSL_EVP_UNSUPPORTED` during the build, set the following in `NODE_OPTIONS` and repeat the build. [More info](https://stackoverflow.com/questions/69692842/error-message-error0308010cdigital-envelope-routinesunsupported).
+
+    ```Shell
+    export NODE_OPTIONS=--openssl-legacy-provider
+    ```
+
+    Build artifacts are saved in:
+
+    - `./agent/dist`: agent binaries and installer packages
+    - `./harness/dist`: `det` CLI Python wheel package
+    - `./master/dist`: master binaries and installer packages
+
 ## Community
 
 If you need help, want to file a bug report, or just want to keep up-to-date
